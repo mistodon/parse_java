@@ -29,8 +29,8 @@ pub enum JavaParseErrorKind {
     #[fail(display = "Parse error")]
     ParseError(#[cause] ParseError),
 
-    #[fail(display = "Unknown error")]
-    UnknownError,
+    #[fail(display = "Unknown error: parser line {}", _0)]
+    UnknownError(u32),
 }
 
 impl From<ParseError> for InnerParseError {
@@ -83,6 +83,7 @@ pub struct Class<'a> {
 pub struct Type<'a> {
     pub type_name: Scoped<'a>,
     pub type_params: Vec<Type<'a>>,
+    pub is_array: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -180,10 +181,22 @@ pub fn parse_file<'a>(
                 if b == b'\n' {
                     line += 1;
                     col = 0;
+                } else {
+                    col += 1;
                 }
             }
             (line, col + 1)
         };
+        eprintln!(
+            "{}:{} is '{}'",
+            line,
+            col,
+            if e.byte < source.len() {
+                source.as_bytes()[e.byte]
+            } else {
+                0
+            }
+        );
         JavaParseError {
             line,
             col,
@@ -202,7 +215,7 @@ pub fn parse_file<'a>(
     let package = parse_path(parser)
         .ok_or(InnerParseError {
             byte: parser.cursor(),
-            kind: JavaParseErrorKind::UnknownError,
+            kind: JavaParseErrorKind::UnknownError(line!()),
         })
         .map_err(convert_error)?;
     parser.expect(b";").map_err(|e| convert_error(e.into()))?;
@@ -247,7 +260,7 @@ fn parse_imports<'a>(parser: &mut Parser<'a>) -> Result<Vec<Import<'a>>, InnerPa
         let is_static = parser.skip_keyword(b"static");
         let path = parse_path(parser).ok_or_else(|| InnerParseError {
             byte: parser.cursor(),
-            kind: JavaParseErrorKind::UnknownError,
+            kind: JavaParseErrorKind::UnknownError(line!()),
         })?;
         let star = parser.skip(b"*");
 
@@ -269,7 +282,30 @@ fn skip_visibility<'a>(parser: &mut Parser<'a>) -> bool {
         || parser.skip_keyword(b"private")
 }
 
+fn parse_annotations<'a>(parser: &mut Parser<'a>) -> Result<Vec<Type<'a>>, InnerParseError> {
+    let mut annotations = vec![];
+    while parser.skip(b"@") {
+        let annotation = match parse_type(parser)? {
+            Some(annotation) => annotation,
+            None => {
+                return Err(InnerParseError {
+                    byte: parser.cursor(),
+                    kind: JavaParseErrorKind::UnknownError(line!()),
+                })
+            }
+        };
+        if parser.skip(b"(") {
+            parser.skip_inside(b'(', b')')?;
+            parser.expect(b")")?;
+        }
+        annotations.push(annotation);
+    }
+    Ok(annotations)
+}
+
 fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError> {
+    let annotations = parse_annotations(parser)?;
+
     skip_visibility(parser);
 
     while parser.skip(b"static") || parser.skip(b"final") || parser.skip(b"abstract") {}
@@ -280,7 +316,7 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError
     if !is_item {
         return Err(InnerParseError {
             byte: parser.cursor(),
-            kind: JavaParseErrorKind::UnknownError,
+            kind: JavaParseErrorKind::UnknownError(line!()),
         });
     }
 
@@ -296,7 +332,7 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError
     if parser.skip_keyword(b"extends") {
         subtypes.push(parse_type(parser)?.ok_or_else(|| InnerParseError {
             byte: parser.cursor(),
-            kind: JavaParseErrorKind::UnknownError,
+            kind: JavaParseErrorKind::UnknownError(line!()),
         })?);
     }
     if parser.skip_keyword(b"implements") {
@@ -315,6 +351,8 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError
 
     if !is_enum || parser.skip(b";") {
         while !parser.check(b"}") {
+            let annotations = parse_annotations(parser)?;
+
             skip_visibility(parser);
 
             while parser.skip(b"static") || parser.skip(b"final") {}
@@ -322,7 +360,7 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError
             let possible_constructor_name = parser.check_ident();
             let item_type = parse_type(parser)?.ok_or_else(|| InnerParseError {
                 byte: parser.cursor(),
-                kind: JavaParseErrorKind::UnknownError,
+                kind: JavaParseErrorKind::UnknownError(line!()),
             })?;
             if parser.skip(b"(") {
                 let args = try_parse_comma_separated(parser, parse_arg)?;
@@ -335,12 +373,12 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError
                 parser.skip_around(b'{', b'}')?;
 
                 let constructor = Method {
-                    annotations: vec![],
+                    annotations,
                     type_params: vec![],
                     return_type: item_type,
                     name: possible_constructor_name.ok_or_else(|| InnerParseError {
                         byte: parser.cursor(),
-                        kind: JavaParseErrorKind::UnknownError,
+                        kind: JavaParseErrorKind::UnknownError(line!()),
                     })?,
                     args,
                     throws,
@@ -359,7 +397,7 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError
                     parser.skip_around(b'{', b'}')?;
 
                     let method = Method {
-                        annotations: vec![],
+                        annotations,
                         type_params: vec![],
                         return_type: item_type,
                         name,
@@ -372,7 +410,7 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError
                         let _expression_junk = parser.scan_to(b';');
                     }
                     let field = Field {
-                        annotations: vec![],
+                        annotations,
                         field_type: item_type,
                         name,
                         value: SymbolSoup::default(),
@@ -388,7 +426,7 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError
     parser.expect(b"}")?;
 
     Ok(Class {
-        annotations: vec![],
+        annotations,
         name,
         fields,
         methods,
@@ -408,9 +446,15 @@ fn parse_type<'a>(parser: &mut Parser<'a>) -> Result<Option<Type<'a>>, InnerPars
                 parser.expect(b">")?;
             }
 
+            let is_array = parser.skip(b"[");
+            if is_array {
+                parser.expect(b"]")?;
+            }
+
             Ok(Some(Type {
                 type_name: path,
                 type_params,
+                is_array,
             }))
         }
         None => Ok(None),
@@ -418,12 +462,13 @@ fn parse_type<'a>(parser: &mut Parser<'a>) -> Result<Option<Type<'a>>, InnerPars
 }
 
 fn parse_arg<'a>(parser: &mut Parser<'a>) -> Result<Option<Arg<'a>>, InnerParseError> {
+    let annotations = parse_annotations(parser)?;
     let arg_type = parse_type(parser)?;
     match arg_type {
         Some(arg_type) => {
             let name = parser.expect_ident()?;
             Ok(Some(Arg {
-                annotations: vec![],
+                annotations,
                 arg_type,
                 name,
             }))
@@ -574,6 +619,7 @@ mod tests {
         Type {
             type_name: Scoped(path.to_owned()),
             type_params: params.to_vec(),
+            is_array: false,
         }
     }
 
@@ -616,6 +662,18 @@ mod tests {
         "public class Thing {}",
         parse_class,
         Class {
+            name: b"Thing",
+            ..Class::default()
+        },
+        ""
+    );
+    testcase_ok!(
+        empty_class_with_annotation,
+        "@Singleton
+        public class Thing {}",
+        parse_class,
+        Class {
+            annotations: vec![mktype(&[b"Singleton"], &[])],
             name: b"Thing",
             ..Class::default()
         },
@@ -787,7 +845,10 @@ mod tests {
         ];
 
         for (src, package) in tests {
-            assert_eq!(parse_file(src).unwrap().package, Scoped(package.to_vec()));
+            assert_eq!(
+                parse_file(src, None).unwrap().package,
+                Scoped(package.to_vec())
+            );
         }
     }
 }
