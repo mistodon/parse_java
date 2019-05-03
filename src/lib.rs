@@ -1,11 +1,51 @@
-use failure::{self, bail, Error};
+use std::{io, path::Path};
 
-use pchomp::Parser;
+use failure::Fail;
+
+use pchomp::{ParseError, Parser};
+
+#[derive(Debug, Fail)]
+#[fail(
+    display = "Error in file {:?} at {}:{}: `{}`",
+    filename, line, col, kind
+)]
+pub struct JavaParseError {
+    pub line: usize,
+    pub col: usize,
+    pub byte: usize,
+    pub filename: Option<String>,
+    pub kind: JavaParseErrorKind,
+}
+
+#[derive(Debug, Fail)]
+#[fail(display = "Internal error type")]
+pub struct InnerParseError {
+    byte: usize,
+    kind: JavaParseErrorKind,
+}
+
+#[derive(Debug, Fail)]
+pub enum JavaParseErrorKind {
+    #[fail(display = "Parse error")]
+    ParseError(#[cause] ParseError),
+
+    #[fail(display = "Unknown error")]
+    UnknownError,
+}
+
+impl From<ParseError> for InnerParseError {
+    fn from(e: ParseError) -> InnerParseError {
+        InnerParseError {
+            byte: e.byte,
+            kind: JavaParseErrorKind::ParseError(e),
+        }
+    }
+}
 
 pub type Ident<'a> = &'a [u8];
 
 #[derive(Debug, Default, Clone, PartialEq)]
-pub struct Path<'a>(pub Vec<Ident<'a>>);
+pub struct Scoped<'a>(pub Vec<Ident<'a>>);
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct SymbolSoup<'a> {
@@ -15,7 +55,7 @@ pub struct SymbolSoup<'a> {
 #[derive(Debug, PartialEq)]
 pub struct Parse<'a> {
     pub source: &'a str,
-    pub package: Path<'a>,
+    pub package: Scoped<'a>,
     pub imports: Vec<Import<'a>>,
     pub import_span: [usize; 2],
     pub classes: Vec<Class<'a>>,
@@ -23,7 +63,7 @@ pub struct Parse<'a> {
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Import<'a> {
-    pub path: Path<'a>,
+    pub path: Scoped<'a>,
     pub is_static: bool,
     pub star: bool,
 }
@@ -41,7 +81,7 @@ pub struct Class<'a> {
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Type<'a> {
-    pub type_name: Path<'a>,
+    pub type_name: Scoped<'a>,
     pub type_params: Vec<Type<'a>>,
 }
 
@@ -70,21 +110,110 @@ pub struct Arg<'a> {
     pub arg_type: Type<'a>,
 }
 
-pub fn parse_file(source: &str) -> Result<Parse, Error> {
+pub struct Project {
+    files: Vec<(String, String)>,
+}
+
+pub fn read_parent_project<P: AsRef<Path>>(filename: P) -> io::Result<Project> {
+    let path = filename.as_ref();
+    let mut path = Some(path);
+    while let Some(name) = path.and_then(Path::file_name) {
+        match name == "src" {
+            true => break,
+            false => path = path.unwrap().parent(),
+        }
+    }
+
+    let src_path = path.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            failure::err_msg("Source directory not found in parent tree"),
+        )
+    })?;
+    read_project(&src_path)
+}
+
+pub fn read_project<P: AsRef<Path>>(dir: P) -> io::Result<Project> {
+    use std::fs;
+
+    let mut paths = vec![dir.as_ref().to_owned()];
+    let mut files = vec![];
+
+    while let Some(path) = paths.pop() {
+        for entry in fs::read_dir(&path)? {
+            let entry = entry?;
+            match entry.file_type()? {
+                t if t.is_dir() => paths.push(entry.path()),
+                t if t.is_file() => {
+                    let path = entry.path();
+                    if path.extension() == Some("java".as_ref()) {
+                        let name = path.display().to_string();
+                        let content = fs::read_to_string(&path)?;
+                        files.push((name, content));
+                    }
+                }
+                _ => (),
+            }
+        }
+    }
+
+    Ok(Project { files })
+}
+
+pub fn parse_project<'a>(project: &'a Project) -> Result<Vec<Parse<'a>>, JavaParseError> {
+    project
+        .files
+        .iter()
+        .map(|(name, source)| parse_file(source, Some(name)))
+        .collect()
+}
+
+pub fn parse_file<'a>(
+    source: &'a str,
+    filename: Option<&str>,
+) -> Result<Parse<'a>, JavaParseError> {
+    let convert_error = |e: InnerParseError| {
+        let (line, col) = {
+            let mut line = 1;
+            let mut col = 0;
+            for &b in &source.as_bytes()[..e.byte] {
+                if b == b'\n' {
+                    line += 1;
+                    col = 0;
+                }
+            }
+            (line, col + 1)
+        };
+        JavaParseError {
+            line,
+            col,
+            byte: e.byte,
+            filename: filename.map(str::to_owned),
+            kind: e.kind,
+        }
+    };
+
     let parser = &mut Parser::new(source);
     parser.skip_whitespace();
-    parser.expect_keyword(b"package")?;
+    parser
+        .expect_keyword(b"package")
+        .map_err(|e| convert_error(e.into()))?;
 
-    let package = parse_path(parser).ok_or(failure::err_msg("Expected package name"))?;
-    parser.expect(b";")?;
+    let package = parse_path(parser)
+        .ok_or(InnerParseError {
+            byte: parser.cursor(),
+            kind: JavaParseErrorKind::UnknownError,
+        })
+        .map_err(convert_error)?;
+    parser.expect(b";").map_err(|e| convert_error(e.into()))?;
 
     let import_start_point = parser.cursor();
-    let imports = parse_imports(parser)?;
+    let imports = parse_imports(parser).map_err(convert_error)?;
     let import_end_point = parser.cursor();
 
     let mut classes = vec![];
     while !parser.finished() {
-        classes.push(parse_class(parser)?);
+        classes.push(parse_class(parser).map_err(convert_error)?);
     }
 
     Ok(Parse {
@@ -96,7 +225,7 @@ pub fn parse_file(source: &str) -> Result<Parse, Error> {
     })
 }
 
-fn parse_path<'a>(parser: &mut Parser<'a>) -> Option<Path<'a>> {
+fn parse_path<'a>(parser: &mut Parser<'a>) -> Option<Scoped<'a>> {
     let mut path = vec![];
     while let Some(ident) = parser.skip_ident() {
         path.push(ident);
@@ -107,16 +236,19 @@ fn parse_path<'a>(parser: &mut Parser<'a>) -> Option<Path<'a>> {
     if path.is_empty() {
         None
     } else {
-        Some(Path(path))
+        Some(Scoped(path))
     }
 }
 
-fn parse_imports<'a>(parser: &mut Parser<'a>) -> Result<Vec<Import<'a>>, Error> {
+fn parse_imports<'a>(parser: &mut Parser<'a>) -> Result<Vec<Import<'a>>, InnerParseError> {
     let mut imports = vec![];
 
     while parser.skip_keyword(b"import") {
         let is_static = parser.skip_keyword(b"static");
-        let path = parse_path(parser).ok_or(failure::err_msg("Expected import path"))?;
+        let path = parse_path(parser).ok_or_else(|| InnerParseError {
+            byte: parser.cursor(),
+            kind: JavaParseErrorKind::UnknownError,
+        })?;
         let star = parser.skip(b"*");
 
         imports.push(Import {
@@ -137,17 +269,19 @@ fn skip_visibility<'a>(parser: &mut Parser<'a>) -> bool {
         || parser.skip_keyword(b"private")
 }
 
-fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, Error> {
+fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError> {
     skip_visibility(parser);
 
-    while parser.skip(b"static") || parser.skip(b"final") || parser.skip(b"abstract") {
-    }
+    while parser.skip(b"static") || parser.skip(b"final") || parser.skip(b"abstract") {}
 
     let is_enum = parser.skip_keyword(b"enum");
     let is_item = is_enum || parser.skip_keyword(b"class") || parser.skip_keyword(b"interface");
 
     if !is_item {
-        bail!("Expected class, interface, or enum");
+        return Err(InnerParseError {
+            byte: parser.cursor(),
+            kind: JavaParseErrorKind::UnknownError,
+        });
     }
 
     let name = parser.expect_ident()?;
@@ -160,9 +294,10 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, Error> {
 
     let mut subtypes = vec![];
     if parser.skip_keyword(b"extends") {
-        subtypes.push(parse_type(parser)?.ok_or(failure::err_msg(
-            "Expected superclass after `extends` keyword",
-        ))?);
+        subtypes.push(parse_type(parser)?.ok_or_else(|| InnerParseError {
+            byte: parser.cursor(),
+            kind: JavaParseErrorKind::UnknownError,
+        })?);
     }
     if parser.skip_keyword(b"implements") {
         subtypes.append(&mut try_parse_comma_separated(parser, parse_type)?);
@@ -182,23 +317,31 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, Error> {
         while !parser.check(b"}") {
             skip_visibility(parser);
 
-            while parser.skip(b"static") || parser.skip(b"final") {
-            }
+            while parser.skip(b"static") || parser.skip(b"final") {}
 
             let possible_constructor_name = parser.check_ident();
-            let item_type = parse_type(parser)?.ok_or(failure::err_msg("Expected a type name"))?;
+            let item_type = parse_type(parser)?.ok_or_else(|| InnerParseError {
+                byte: parser.cursor(),
+                kind: JavaParseErrorKind::UnknownError,
+            })?;
             if parser.skip(b"(") {
                 let args = try_parse_comma_separated(parser, parse_arg)?;
                 parser.expect(b")")?;
-                let throws = if parser.skip_keyword(b"throws") { try_parse_comma_separated(parser, parse_type)? } else { vec![] };
+                let throws = if parser.skip_keyword(b"throws") {
+                    try_parse_comma_separated(parser, parse_type)?
+                } else {
+                    vec![]
+                };
                 parser.skip_around(b'{', b'}')?;
 
                 let constructor = Method {
                     annotations: vec![],
                     type_params: vec![],
                     return_type: item_type,
-                    name: possible_constructor_name
-                        .ok_or(failure::err_msg("Expected constructor name"))?,
+                    name: possible_constructor_name.ok_or_else(|| InnerParseError {
+                        byte: parser.cursor(),
+                        kind: JavaParseErrorKind::UnknownError,
+                    })?,
                     args,
                     throws,
                 };
@@ -208,7 +351,11 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, Error> {
                 if parser.skip(b"(") {
                     let args = try_parse_comma_separated(parser, parse_arg)?;
                     parser.expect(b")")?;
-                    let throws = if parser.skip_keyword(b"throws") { try_parse_comma_separated(parser, parse_type)? } else { vec![] };
+                    let throws = if parser.skip_keyword(b"throws") {
+                        try_parse_comma_separated(parser, parse_type)?
+                    } else {
+                        vec![]
+                    };
                     parser.skip_around(b'{', b'}')?;
 
                     let method = Method {
@@ -251,7 +398,7 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, Error> {
     })
 }
 
-fn parse_type<'a>(parser: &mut Parser<'a>) -> Result<Option<Type<'a>>, Error> {
+fn parse_type<'a>(parser: &mut Parser<'a>) -> Result<Option<Type<'a>>, InnerParseError> {
     match parse_path(parser) {
         Some(path) => {
             let mut type_params = vec![];
@@ -270,7 +417,7 @@ fn parse_type<'a>(parser: &mut Parser<'a>) -> Result<Option<Type<'a>>, Error> {
     }
 }
 
-fn parse_arg<'a>(parser: &mut Parser<'a>) -> Result<Option<Arg<'a>>, Error> {
+fn parse_arg<'a>(parser: &mut Parser<'a>) -> Result<Option<Arg<'a>>, InnerParseError> {
     let arg_type = parse_type(parser)?;
     match arg_type {
         Some(arg_type) => {
@@ -299,9 +446,12 @@ where
     results
 }
 
-fn try_parse_comma_separated<'a, T, F>(parser: &mut Parser<'a>, f: F) -> Result<Vec<T>, Error>
+fn try_parse_comma_separated<'a, T, F>(
+    parser: &mut Parser<'a>,
+    f: F,
+) -> Result<Vec<T>, InnerParseError>
 where
-    F: Fn(&mut Parser<'a>) -> Result<Option<T>, Error>,
+    F: Fn(&mut Parser<'a>) -> Result<Option<T>, InnerParseError>,
 {
     let mut results = vec![];
     while let Some(item) = f(parser)? {
@@ -357,25 +507,31 @@ mod tests {
     }
 
     testcase!(empty_path, "", parse_path, None, "");
-    testcase!(path_of_one, "one", parse_path, Some(Path(vec![b"one"])), "");
+    testcase!(
+        path_of_one,
+        "one",
+        parse_path,
+        Some(Scoped(vec![b"one"])),
+        ""
+    );
     testcase!(
         path_of_two,
         "one.Two",
         parse_path,
-        Some(Path(vec![b"one", b"Two"])),
+        Some(Scoped(vec![b"one", b"Two"])),
         ""
     );
     testcase!(
         path_trims,
         "one.Two  ;",
         parse_path,
-        Some(Path(vec![b"one", b"Two"])),
+        Some(Scoped(vec![b"one", b"Two"])),
         ";"
     );
 
     fn mkimport(path: &[&'static [u8]], is_static: bool, star: bool) -> Import<'static> {
         Import {
-            path: Path(path.to_vec()),
+            path: Scoped(path.to_vec()),
             is_static,
             star,
         }
@@ -416,7 +572,7 @@ mod tests {
 
     fn mktype(path: &[&'static [u8]], params: &[Type<'static>]) -> Type<'static> {
         Type {
-            type_name: Path(path.to_owned()),
+            type_name: Scoped(path.to_owned()),
             type_params: params.to_vec(),
         }
     }
@@ -579,7 +735,11 @@ mod tests {
         parse_class,
         Class {
             name: b"Thing",
-            fields: vec![Field { field_type: mktype(&[b"int"], &[]), name: b"size", ..Field::default() }],
+            fields: vec![Field {
+                field_type: mktype(&[b"int"], &[]),
+                name: b"size",
+                ..Field::default()
+            }],
             ..Class::default()
         },
         ""
@@ -590,7 +750,11 @@ mod tests {
         parse_class,
         Class {
             name: b"Thing",
-            fields: vec![Field { field_type: mktype(&[b"int"], &[]), name: b"size", ..Field::default() }],
+            fields: vec![Field {
+                field_type: mktype(&[b"int"], &[]),
+                name: b"size",
+                ..Field::default()
+            }],
             ..Class::default()
         },
         ""
@@ -601,7 +765,11 @@ mod tests {
         parse_class,
         Class {
             name: b"Thing",
-            fields: vec![Field { field_type: mktype(&[b"int"], &[]), name: b"size", ..Field::default() }],
+            fields: vec![Field {
+                field_type: mktype(&[b"int"], &[]),
+                name: b"size",
+                ..Field::default()
+            }],
             ..Class::default()
         },
         ""
@@ -619,7 +787,7 @@ mod tests {
         ];
 
         for (src, package) in tests {
-            assert_eq!(parse_file(src).unwrap().package, Path(package.to_vec()));
+            assert_eq!(parse_file(src).unwrap().package, Scoped(package.to_vec()));
         }
     }
 }
