@@ -1,4 +1,4 @@
-use std::{io, path::Path};
+use std::{fmt::{self, Display, Formatter}, io, path::Path};
 
 use failure::Fail;
 
@@ -42,10 +42,22 @@ impl From<ParseError> for InnerParseError {
     }
 }
 
-pub type Ident<'a> = &'a [u8];
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Ident<'a>(&'a [u8]);
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Scoped<'a>(pub Vec<Ident<'a>>);
+
+impl<'a> Display for Scoped<'a> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let strings = self.0.iter()
+            .map(|ident| std::str::from_utf8(ident.0))
+            .map(|result| result.unwrap_or("<binary>"))
+            .collect::<Vec<_>>();
+
+        write!(f, "{}", strings.join("."))
+    }
+}
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct SymbolSoup<'a> {
@@ -61,7 +73,7 @@ pub struct Parse<'a> {
     pub classes: Vec<Class<'a>>,
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Import<'a> {
     pub path: Scoped<'a>,
     pub is_static: bool,
@@ -238,9 +250,13 @@ pub fn parse_file<'a>(
     })
 }
 
+fn parse_ident<'a>(parser: &mut Parser<'a>) -> Option<Ident<'a>> {
+    parser.skip_ident().map(Ident)
+}
+
 fn parse_path<'a>(parser: &mut Parser<'a>) -> Option<Scoped<'a>> {
     let mut path = vec![];
-    while let Some(ident) = parser.skip_ident() {
+    while let Some(ident) = parse_ident(parser) {
         path.push(ident);
         if !parser.skip(b".") {
             break;
@@ -320,11 +336,11 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError
         });
     }
 
-    let name = parser.expect_ident()?;
+    let name = Ident(parser.expect_ident()?);
 
     let mut type_params = vec![];
     if parser.skip(b"<") {
-        type_params = parse_comma_separated(parser, Parser::skip_ident);
+        type_params = parse_comma_separated(parser, parse_ident);
         parser.expect(b">")?;
     }
 
@@ -346,7 +362,7 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError
     parser.expect(b"{")?;
 
     if is_enum {
-        variants = parse_comma_separated(parser, Parser::skip_ident);
+        variants = parse_comma_separated(parser, parse_ident);
     }
 
     if !is_enum || parser.skip(b";") {
@@ -357,7 +373,18 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError
 
             while parser.skip(b"static") || parser.skip(b"final") {}
 
-            let possible_constructor_name = parser.check_ident();
+            // TODO: Actually parse inner classes
+            if parser.check(b"class") {
+                parse_class(parser); // Ignoring result and visibility/annotations
+            }
+
+            let mut type_params = vec![];
+            if parser.skip(b"<") {
+                type_params = parse_comma_separated(parser, parse_ident);
+                parser.expect(b">")?;
+            }
+
+            let possible_constructor_name = parser.check_ident().map(Ident);
             let item_type = parse_type(parser)?.ok_or_else(|| InnerParseError {
                 byte: parser.cursor(),
                 kind: JavaParseErrorKind::UnknownError(line!()),
@@ -374,7 +401,7 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError
 
                 let constructor = Method {
                     annotations,
-                    type_params: vec![],
+                    type_params,
                     return_type: item_type,
                     name: possible_constructor_name.ok_or_else(|| InnerParseError {
                         byte: parser.cursor(),
@@ -385,7 +412,7 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError
                 };
                 methods.push(constructor);
             } else {
-                let name = parser.expect_ident()?;
+                let name = Ident(parser.expect_ident()?);
                 if parser.skip(b"(") {
                     let args = try_parse_comma_separated(parser, parse_arg)?;
                     parser.expect(b")")?;
@@ -394,11 +421,14 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError
                     } else {
                         vec![]
                     };
-                    parser.skip_around(b'{', b'}')?;
+
+                    if !parser.skip(b";") {
+                        parser.skip_around(b'{', b'}')?;
+                    }
 
                     let method = Method {
                         annotations,
-                        type_params: vec![],
+                        type_params,
                         return_type: item_type,
                         name,
                         args,
@@ -437,6 +467,15 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError
 }
 
 fn parse_type<'a>(parser: &mut Parser<'a>) -> Result<Option<Type<'a>>, InnerParseError> {
+    // TODO: Handle wildcards properly
+    if parser.skip(b"?") {
+        return Ok(Some(Type {
+            type_name: Scoped(vec!()),
+            type_params: vec![],
+            is_array: false,
+        }));
+    }
+
     match parse_path(parser) {
         Some(path) => {
             let mut type_params = vec![];
@@ -462,11 +501,14 @@ fn parse_type<'a>(parser: &mut Parser<'a>) -> Result<Option<Type<'a>>, InnerPars
 }
 
 fn parse_arg<'a>(parser: &mut Parser<'a>) -> Result<Option<Arg<'a>>, InnerParseError> {
+    // TODO: Modifiers properly
+    parser.skip(b"final");
+
     let annotations = parse_annotations(parser)?;
     let arg_type = parse_type(parser)?;
     match arg_type {
         Some(arg_type) => {
-            let name = parser.expect_ident()?;
+            let name = Ident(parser.expect_ident()?);
             Ok(Some(Arg {
                 annotations,
                 arg_type,
