@@ -1,5 +1,5 @@
 [package]
-name = "coffeegrains"
+name = "parse_java"
 version = "0.1.0"
 authors = ["Claire Harris <wishing.engine@gmail.com>"]
 edition = "2018"
