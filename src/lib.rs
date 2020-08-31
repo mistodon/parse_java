@@ -1,127 +1,15 @@
-use std::{fmt::{self, Display, Formatter}, io, path::Path};
+mod data;
+mod error;
 
-use failure::Fail;
+pub use data::*;
+pub use error::*;
 
-use pchomp::{ParseError, Parser};
+use std::{
+    io,
+    path::Path,
+};
 
-#[derive(Debug, Fail)]
-#[fail(
-    display = "Error in file {:?} at {}:{}: `{}`",
-    filename, line, col, kind
-)]
-pub struct JavaParseError {
-    pub line: usize,
-    pub col: usize,
-    pub byte: usize,
-    pub filename: Option<String>,
-    pub kind: JavaParseErrorKind,
-}
-
-#[derive(Debug, Fail)]
-#[fail(display = "Internal error type")]
-pub struct InnerParseError {
-    byte: usize,
-    kind: JavaParseErrorKind,
-}
-
-#[derive(Debug, Fail)]
-pub enum JavaParseErrorKind {
-    #[fail(display = "Parse error")]
-    ParseError(#[cause] ParseError),
-
-    #[fail(display = "Unknown error: parser line {}", _0)]
-    UnknownError(u32),
-}
-
-impl From<ParseError> for InnerParseError {
-    fn from(e: ParseError) -> InnerParseError {
-        InnerParseError {
-            byte: e.byte,
-            kind: JavaParseErrorKind::ParseError(e),
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct Ident<'a>(&'a [u8]);
-
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct Scoped<'a>(pub Vec<Ident<'a>>);
-
-impl<'a> Display for Scoped<'a> {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        let strings = self.0.iter()
-            .map(|ident| std::str::from_utf8(ident.0))
-            .map(|result| result.unwrap_or("<binary>"))
-            .collect::<Vec<_>>();
-
-        write!(f, "{}", strings.join("."))
-    }
-}
-
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct SymbolSoup<'a> {
-    pub idents: Vec<Ident<'a>>,
-}
-
-#[derive(Debug, PartialEq)]
-pub struct Parse<'a> {
-    pub source: &'a str,
-    pub package: Scoped<'a>,
-    pub imports: Vec<Import<'a>>,
-    pub import_span: [usize; 2],
-    pub classes: Vec<Class<'a>>,
-}
-
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct Import<'a> {
-    pub path: Scoped<'a>,
-    pub is_static: bool,
-    pub star: bool,
-}
-
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct Class<'a> {
-    pub annotations: Vec<Type<'a>>,
-    pub name: Ident<'a>,
-    pub fields: Vec<Field<'a>>,
-    pub methods: Vec<Method<'a>>,
-    pub variants: Vec<Ident<'a>>,
-    pub type_params: Vec<Ident<'a>>,
-    pub subtypes: Vec<Type<'a>>,
-}
-
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct Type<'a> {
-    pub type_name: Scoped<'a>,
-    pub type_params: Vec<Type<'a>>,
-    pub is_array: bool,
-}
-
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct Field<'a> {
-    pub annotations: Vec<Type<'a>>,
-    pub name: Ident<'a>,
-    pub field_type: Type<'a>,
-    pub value: SymbolSoup<'a>,
-}
-
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct Method<'a> {
-    pub annotations: Vec<Type<'a>>,
-    pub type_params: Vec<Ident<'a>>,
-    pub return_type: Type<'a>,
-    pub name: Ident<'a>,
-    pub args: Vec<Arg<'a>>,
-    pub throws: Vec<Type<'a>>,
-}
-
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct Arg<'a> {
-    pub annotations: Vec<Type<'a>>,
-    pub name: Ident<'a>,
-    pub arg_type: Type<'a>,
-}
+use pchomp::{Parser};
 
 pub struct Project {
     files: Vec<(String, String)>,
@@ -250,11 +138,11 @@ pub fn parse_file<'a>(
     })
 }
 
-fn parse_ident<'a>(parser: &mut Parser<'a>) -> Option<Ident<'a>> {
+fn parse_ident<'a>(parser: &mut Parser<'a>) -> Option<Ident<&'a [u8]>> {
     parser.skip_ident().map(Ident)
 }
 
-fn parse_path<'a>(parser: &mut Parser<'a>) -> Option<Scoped<'a>> {
+fn parse_path<'a>(parser: &mut Parser<'a>) -> Option<Scoped<&'a [u8]>> {
     let mut path = vec![];
     while let Some(ident) = parse_ident(parser) {
         path.push(ident);
@@ -269,7 +157,7 @@ fn parse_path<'a>(parser: &mut Parser<'a>) -> Option<Scoped<'a>> {
     }
 }
 
-fn parse_imports<'a>(parser: &mut Parser<'a>) -> Result<Vec<Import<'a>>, InnerParseError> {
+fn parse_imports<'a>(parser: &mut Parser<'a>) -> Result<Vec<Import<&'a [u8]>>, InnerParseError> {
     let mut imports = vec![];
 
     while parser.skip_keyword(b"import") {
@@ -298,7 +186,7 @@ fn skip_visibility<'a>(parser: &mut Parser<'a>) -> bool {
         || parser.skip_keyword(b"private")
 }
 
-fn parse_annotations<'a>(parser: &mut Parser<'a>) -> Result<Vec<Type<'a>>, InnerParseError> {
+fn parse_annotations<'a>(parser: &mut Parser<'a>) -> Result<Vec<Type<&'a [u8]>>, InnerParseError> {
     let mut annotations = vec![];
     while parser.skip(b"@") {
         let annotation = match parse_type(parser)? {
@@ -319,7 +207,7 @@ fn parse_annotations<'a>(parser: &mut Parser<'a>) -> Result<Vec<Type<'a>>, Inner
     Ok(annotations)
 }
 
-fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError> {
+fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<&'a [u8]>, InnerParseError> {
     let annotations = parse_annotations(parser)?;
 
     skip_visibility(parser);
@@ -466,11 +354,11 @@ fn parse_class<'a>(parser: &mut Parser<'a>) -> Result<Class<'a>, InnerParseError
     })
 }
 
-fn parse_type<'a>(parser: &mut Parser<'a>) -> Result<Option<Type<'a>>, InnerParseError> {
+fn parse_type<'a>(parser: &mut Parser<'a>) -> Result<Option<Type<&'a [u8]>>, InnerParseError> {
     // TODO: Handle wildcards properly
     if parser.skip(b"?") {
         return Ok(Some(Type {
-            type_name: Scoped(vec!()),
+            type_name: Scoped(vec![]),
             type_params: vec![],
             is_array: false,
         }));
@@ -500,7 +388,7 @@ fn parse_type<'a>(parser: &mut Parser<'a>) -> Result<Option<Type<'a>>, InnerPars
     }
 }
 
-fn parse_arg<'a>(parser: &mut Parser<'a>) -> Result<Option<Arg<'a>>, InnerParseError> {
+fn parse_arg<'a>(parser: &mut Parser<'a>) -> Result<Option<Arg<&'a [u8]>>, InnerParseError> {
     // TODO: Modifiers properly
     parser.skip(b"final");
 
